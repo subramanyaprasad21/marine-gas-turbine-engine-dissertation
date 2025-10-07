@@ -1,41 +1,77 @@
+# app.py - robust loader that downloads missing .pkl from GitHub raw if necessary
 from flask import Flask, request, jsonify
-import joblib
+import joblib, os, sys, requests, time
 import pandas as pd
-import os
-import sys
 
 app = Flask(__name__)
 
-# Print out the files at startup for debugging
-print("=== STARTUP: Listing files in current directory ===", file=sys.stderr)
-for f in sorted(os.listdir(".")):
-    print(" -", f, file=sys.stderr)
-print("===================================================", file=sys.stderr)
+# ---------- CONFIG: update these if your repo/branch/username differ ----------
+GITHUB_USER = "subramanyaprasad21"
+GITHUB_REPO = "marine-gas-turbine-engine-dissertation"
+GITHUB_BRANCH = "main"   # usually main or master
+# ---------------------------------------------------------------------------
 
-# ✅ Update this dictionary to match your uploaded filenames
+# Map logical target -> expected filename in repo root
 MODEL_FILES = {
     "Fuel_flow_mf_kg/s": "rf_Fuel_flow_mf_kg_s.pkl",
-    "GT_Turbine_decay_state_coefficient": "rf_GT_Turbine_decay_state_coefficient_compressed.pkl",  # <- compressed file
+    "GT_Turbine_decay_state_coefficient": "rf_GT_Turbine_decay_state_coefficient_compressed.pkl",
     "GT_Compressor_decay_state_coefficient": "rf_GT_Compressor_decay_state_coefficient.pkl"
 }
 
 MODELS = {}
 missing_files = []
+download_errors = []
 
-# Load models safely
-for key, filename in MODEL_FILES.items():
-    if os.path.exists(filename):
-        try:
-            MODELS[key] = joblib.load(filename)
-            print(f"✅ Loaded model for {key} from {filename}", file=sys.stderr)
-        except Exception as e:
-            print(f"❌ Failed to load {filename}: {e}", file=sys.stderr)
-            missing_files.append(filename)
+# utility to download a raw file from GitHub
+def download_from_github_raw(filename, dest_path):
+    raw_url = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{filename}"
+    try:
+        print(f"Attempting to download {filename} from {raw_url}", file=sys.stderr)
+        resp = requests.get(raw_url, timeout=30, stream=True)
+        if resp.status_code == 200:
+            with open(dest_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            print(f"Downloaded {filename} -> {dest_path}", file=sys.stderr)
+            return True
+        else:
+            print(f"Failed to download {filename}: HTTP {resp.status_code}", file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"Exception downloading {filename}: {e}", file=sys.stderr)
+        return False
+
+# show what files are present (very helpful in Railway logs)
+print("=== STARTUP: listing current directory files ===", file=sys.stderr)
+for f in sorted(os.listdir(".")):
+    print(" -", f, file=sys.stderr)
+print("=== END STARTUP LIST ===", file=sys.stderr)
+
+# ensure requests is available; Railway installs requirements, so OK
+# Try to ensure each model exists locally, otherwise attempt to download from GitHub raw
+for key, fname in MODEL_FILES.items():
+    if os.path.exists(fname):
+        print(f"Found file {fname} locally", file=sys.stderr)
     else:
-        print(f"⚠️ Missing model file: {filename}", file=sys.stderr)
-        missing_files.append(filename)
+        print(f"File {fname} not found locally. Attempting to fetch from GitHub.", file=sys.stderr)
+        ok = download_from_github_raw(fname, fname)
+        if not ok:
+            download_errors.append(fname)
 
-# Feature columns must exactly match those used during training
+# Now try loading models
+for key, fname in MODEL_FILES.items():
+    try:
+        if not os.path.exists(fname):
+            missing_files.append(fname)
+            continue
+        MODELS[key] = joblib.load(fname)
+        print(f"Loaded model for {key} from {fname}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error loading model {fname}: {e}", file=sys.stderr)
+        download_errors.append(fname)
+
+# Feature columns - must match training
 FEATURE_COLUMNS = [
     "Lever_position",
     "Ship_speed_v",
@@ -54,58 +90,35 @@ FEATURE_COLUMNS = [
     "Turbine_Injecton_Control_TIC_"
 ]
 
-@app.route('/')
-def home():
-    """Root route to show server status."""
-    if missing_files:
-        return jsonify({
-            "status": "error",
-            "message": "Some model files are missing.",
-            "missing_files": missing_files
-        }), 500
-    return jsonify({
-        "status": "ok",
-        "message": "API is running and all models are loaded successfully."
-    }), 200
+@app.route("/")
+def index():
+    status = {
+        "models_loaded": list(MODELS.keys()),
+        "missing_files": missing_files,
+        "download_errors": download_errors
+    }
+    code = 200 if not missing_files and not download_errors else 500
+    return jsonify(status), code
 
-
-@app.route('/predict', methods=['POST'])
+@app.route("/predict", methods=["POST"])
 def predict():
-    """POST endpoint to get predictions for turbine data."""
-    try:
-        if not MODELS:
-            return jsonify({
-                "error": "Models not loaded",
-                "details": "Check the logs for missing files"
-            }), 500
+    if not MODELS:
+        return jsonify({"error": "No models loaded", "missing": missing_files, "download_errors": download_errors}), 500
+    data = request.get_json(force=True)
+    if isinstance(data, dict):
+        records = [data]
+    else:
+        records = data
+    df = pd.DataFrame(records)
+    missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing_cols:
+        return jsonify({"error": "Missing input columns", "missing_columns": missing_cols}), 400
+    X = df[FEATURE_COLUMNS]
+    outputs = {}
+    for target, model in MODELS.items():
+        preds = model.predict(X).tolist()
+        outputs[target] = preds if len(preds) > 1 else preds[0]
+    return jsonify(outputs)
 
-        data = request.get_json(force=True)
-
-        if isinstance(data, dict):
-            records = [data]
-        else:
-            records = data
-
-        df = pd.DataFrame(records)
-        missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
-        if missing_cols:
-            return jsonify({
-                "error": "Missing required input columns",
-                "missing_columns": missing_cols
-            }), 400
-
-        X = df[FEATURE_COLUMNS]
-        output = {}
-        for target, model in MODELS.items():
-            preds = model.predict(X).tolist()
-            output[target] = preds if len(preds) > 1 else preds[0]
-
-        return jsonify(output)
-
-    except Exception as e:
-        print(f"❌ Prediction error: {e}", file=sys.stderr)
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
